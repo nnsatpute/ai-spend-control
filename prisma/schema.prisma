@@ -1,0 +1,277 @@
+// AI Spend Control — system of record
+// Domain rules live in src/domain/*; this file is persistence only.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MemberRole {
+  OWNER
+  ADMIN
+  MANAGER
+  VIEWER
+}
+
+enum Provider {
+  CURSOR
+}
+
+enum ConnectionStatus {
+  CONNECTED
+  ERROR
+}
+
+enum BudgetMode {
+  MONITOR
+  ENFORCE
+}
+
+enum CapAction {
+  ALERT
+  CAP
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  memberships    Membership[]
+  connections    Connection[]
+  people         Person[]
+  spendSnapshots SpendSnapshot[]
+  auditLogs      AuditLog[]
+  spendPolicy    SpendPolicy?
+  personBudgets  PersonBudget[]
+  budgetAlerts   BudgetAlert[]
+  dailyUsage     DailyUsage[]
+  anomalyEvents  AnomalyEvent[]
+  digestLogs     DigestLog[]
+
+  @@map("organizations")
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  memberships Membership[]
+  resetTokens PasswordResetToken[]
+
+  @@map("users")
+}
+
+model Membership {
+  id        String     @id @default(cuid())
+  userId    String     @map("user_id")
+  orgId     String     @map("org_id")
+  role      MemberRole @default(VIEWER)
+  createdAt DateTime   @default(now()) @map("created_at")
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, orgId])
+  @@index([orgId])
+  @@map("memberships")
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String   @map("user_id")
+  tokenHash String   @unique @map("token_hash")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("password_reset_tokens")
+}
+
+/// One provider link per org. The admin key is AES-256-GCM encrypted; never select it for the UI.
+model Connection {
+  id           String           @id @default(cuid())
+  orgId        String           @map("org_id")
+  provider     Provider
+  encryptedKey String           @map("encrypted_key")
+  keyHint      String           @map("key_hint")
+  status       ConnectionStatus @default(CONNECTED)
+  lastError    String?          @map("last_error")
+  memberCount  Int              @default(0) @map("member_count")
+  cycleStart   DateTime?        @map("cycle_start")
+  lastSyncedAt DateTime?        @map("last_synced_at")
+  createdAt    DateTime         @default(now()) @map("created_at")
+  updatedAt    DateTime         @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, provider])
+  @@map("connections")
+}
+
+/// Someone whose AI spend is tracked (not necessarily an app user).
+model Person {
+  id               String   @id @default(cuid())
+  orgId            String   @map("org_id")
+  email            String
+  name             String?
+  cursorUserId     String?  @map("cursor_user_id")
+  cursorRole       String?  @map("cursor_role")
+  managerEmail     String?  @map("manager_email")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  organization   Organization    @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  spendSnapshots SpendSnapshot[]
+  personBudget   PersonBudget?
+  budgetAlerts   BudgetAlert[]
+  dailyUsage     DailyUsage[]
+  anomalyEvents  AnomalyEvent[]
+
+  @@unique([orgId, email])
+  @@index([orgId])
+  @@map("people")
+}
+
+/// Latest spend for a person in one provider billing cycle (upserted on each sync).
+model SpendSnapshot {
+  id                  String   @id @default(cuid())
+  orgId               String   @map("org_id")
+  personId            String   @map("person_id")
+  provider            Provider
+  cycleStart          DateTime @map("cycle_start")
+  spendCents          Decimal  @map("spend_cents") @db.Decimal(18, 6)
+  overallSpendCents   Decimal  @map("overall_spend_cents") @db.Decimal(18, 6)
+  premiumRequests     Int      @default(0) @map("premium_requests")
+  effectiveLimitCents Decimal? @map("effective_limit_cents") @db.Decimal(18, 6)
+  syncedAt            DateTime @map("synced_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  person       Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, provider, personId, cycleStart])
+  @@index([orgId, provider, cycleStart])
+  @@map("spend_snapshots")
+}
+
+/// Org-wide budget defaults. People without their own amount use defaultAmountCents.
+model SpendPolicy {
+  id                  String     @id @default(cuid())
+  orgId               String     @unique @map("org_id")
+  defaultAmountCents  Decimal    @map("default_amount_cents") @db.Decimal(18, 6)
+  mode                BudgetMode @default(MONITOR)
+  actionAt100         CapAction  @default(ALERT) @map("action_at_100")
+  slackWebhookEnc     String?    @map("slack_webhook_enc")
+  createdAt           DateTime   @default(now()) @map("created_at")
+  updatedAt           DateTime   @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@map("spend_policies")
+}
+
+model PersonBudget {
+  id          String   @id @default(cuid())
+  orgId       String   @map("org_id")
+  personId    String   @unique @map("person_id")
+  amountCents Decimal  @map("amount_cents") @db.Decimal(18, 6)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  person       Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@index([orgId])
+  @@map("person_budgets")
+}
+
+/// One row per person, billing cycle, and threshold, so an alert fires once.
+model BudgetAlert {
+  id         String   @id @default(cuid())
+  orgId      String   @map("org_id")
+  personId   String   @map("person_id")
+  cycleStart DateTime @map("cycle_start")
+  level      Int
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  person       Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([personId, cycleStart, level])
+  @@index([orgId, cycleStart])
+  @@map("budget_alerts")
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  orgId     String   @map("org_id")
+  actorId   String?  @map("actor_id")
+  action    String
+  detail    String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@index([orgId, createdAt])
+  @@map("audit_logs")
+}
+
+/// One row per person per day. Counts come from Cursor daily usage, not dollars.
+model DailyUsage {
+  id             String   @id @default(cuid())
+  orgId          String   @map("org_id")
+  personId       String   @map("person_id")
+  day            DateTime @db.Date
+  usageBasedReqs Int      @default(0) @map("usage_based_reqs")
+  agentRequests  Int      @default(0) @map("agent_requests")
+  mostUsedModel  String?  @map("most_used_model")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  person       Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, personId, day])
+  @@index([orgId, day])
+  @@map("daily_usage")
+}
+
+model AnomalyEvent {
+  id        String   @id @default(cuid())
+  orgId     String   @map("org_id")
+  personId  String   @map("person_id")
+  day       DateTime @db.Date
+  rule      String
+  value     Int
+  baseline  Decimal  @db.Decimal(18, 4)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  person       Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([personId, day, rule])
+  @@index([orgId, day])
+  @@map("anomaly_events")
+}
+
+/// One row per org per ISO week so the Monday digest is sent once.
+model DigestLog {
+  id        String   @id @default(cuid())
+  orgId     String   @map("org_id")
+  weekStart DateTime @map("week_start") @db.Date
+  createdAt DateTime @default(now()) @map("created_at")
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, weekStart])
+  @@map("digest_logs")
+}
